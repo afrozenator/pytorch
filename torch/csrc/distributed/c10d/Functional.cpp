@@ -454,6 +454,65 @@ at::Tensor all_to_all_single_autograd(
       input, output_split_sizes, input_split_sizes, group_name);
 }
 
+class AllReduceTensor
+    : public torch::autograd::Function<AllReduceTensor> {
+ public:
+  static torch::autograd::Variable forward(
+      torch::autograd::AutogradContext* ctx,
+      const at::Tensor& input,
+      const std::string& reduce_op,
+      int64_t group_size,
+      const std::string& group_name) {
+    TORCH_CHECK(reduce_op == "sum", "Only sum reduce op is supported");
+
+    ctx->saved_data["group_size"] = group_size;
+    ctx->saved_data["group_name"] = group_name;
+
+    return c10::Dispatcher::singleton()
+        .findSchemaOrThrow("_c10d_functional::all_reduce", "")  // TODO(afro): Implement.
+        .typed<decltype(all_reduce)>()  // TODO(afro): Implement.
+        .call(input, reduce_op, group_size, group_name);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* ctx,
+      torch::autograd::variable_list grad_out_list) {
+    const int64_t group_size = ctx->saved_data["group_size"].toInt();
+    const std::string& group_name = ctx->saved_data["group_name"].toStringRef();
+
+    DCHECK(grad_out_list.size() == 1);
+    auto grad_out = grad_out_list[0];
+
+    auto out =
+        c10::Dispatcher::singleton()
+            .findSchemaOrThrow("_c10d_functional::all_reduce", "")
+            .typed<decltype(all_reduce)>()
+            .call(grad_out, group_size, group_name);
+
+    // do an explicit wait to avoid cuda stream issues
+    // TODO: track active cuda stream in wait
+    out = c10::Dispatcher::singleton()
+              .findSchemaOrThrow("_c10d_functional::wait_tensor", "")
+              .typed<decltype(wait_tensor)>()
+              .call(out);
+
+    return {
+        out,
+        at::Tensor(),
+        at::Tensor(),
+        at::Tensor(),
+    };
+  }
+};
+
+at::Tensor all_reduce_tensor_autograd(
+    const at::Tensor& input,
+    const std::string& reduce_op,
+    int64_t group_size,
+    const std::string& group_name) {
+  return AllReduceTensor::apply(input, reduce_op, group_size, group_name);
+}
+
 class ReduceScatterTensor
     : public torch::autograd::Function<ReduceScatterTensor> {
  public:
@@ -586,6 +645,15 @@ TORCH_LIBRARY(_c10d_functional_autograd, m) {
       "str group_name) -> Tensor",
       torch::dispatch(
           c10::DispatchKey::Autograd, ::reduce_scatter_tensor_autograd),
+      {at::Tag::pt2_compliant_tag});
+  m.def(
+      "all_reduce_tensor("
+      "Tensor input, "
+      "str reduce_op, "
+      "int group_size, "
+      "str group_name) -> Tensor",
+      torch::dispatch(
+          c10::DispatchKey::Autograd, ::all_reduce_tensor_autograd),
       {at::Tag::pt2_compliant_tag});
   m.def(
       "all_gather_into_tensor("
